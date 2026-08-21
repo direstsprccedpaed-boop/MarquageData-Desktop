@@ -12,13 +12,13 @@ class TabDQEExport(ctk.CTkFrame):
         self.app = app
         self.bpu_path: Path | None = None
 
-        ctk.CTkLabel(self, text="Analyse du BPUF cible et g\u00e9n\u00e9ration du DQE", font=("", 16, "bold")).pack(pady=(15, 5))
+        ctk.CTkLabel(self, text="Analyse du BPUF cible et génération du DQE", font=("", 16, "bold")).pack(pady=(15, 5))
 
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.pack(fill="x", padx=20, pady=5)
         self.bpu_path_var = ctk.StringVar()
         ctk.CTkEntry(row, textvariable=self.bpu_path_var, width=700).pack(side="left", padx=(0, 10), fill="x", expand=True)
-        ctk.CTkButton(row, text="Choisir le gabarit BPUF (.xlsx)\u2026", command=self.browse_bpu).pack(side="left")
+        ctk.CTkButton(row, text="Choisir le gabarit BPUF (.xlsx)…", command=self.browse_bpu).pack(side="left")
 
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(fill="x", padx=20, pady=10)
@@ -33,7 +33,7 @@ class TabDQEExport(ctk.CTkFrame):
         self.structure_box = ctk.CTkTextbox(self, width=1100, height=250)
         self.structure_box.pack(padx=20, pady=10, fill="both", expand=True)
 
-        self.generate_btn = ctk.CTkButton(self, text="G\u00e9n\u00e9rer le DQE", command=self.generate, state="disabled")
+        self.generate_btn = ctk.CTkButton(self, text="Générer le DQE", command=self.generate, state="disabled")
         self.generate_btn.pack(pady=10)
 
         self.result_label = ctk.CTkLabel(self, text="")
@@ -44,17 +44,19 @@ class TabDQEExport(ctk.CTkFrame):
         if path:
             self.bpu_path_var.set(path)
             self.bpu_path = Path(path)
+            self.state.bpu_path = self.bpu_path
 
     def analyze(self):
         if not self.bpu_path_var.get():
             return
         self.bpu_path = Path(self.bpu_path_var.get())
+        self.state.bpu_path = self.bpu_path
         codes, sections, meta = parse_bpu_structure(self.bpu_path)
 
         cols = meta["cols"]
         if cols.get("_defaults_used"):
             self.warning_label.configure(
-                text=f"\u26a0\ufe0f Colonnes non d\u00e9tect\u00e9es par mot-cl\u00e9 (d\u00e9faut appliqu\u00e9): {cols.get('_missing')}"
+                text=f"⚠️ Colonnes non détectées par mot-clé (défaut appliqué): {cols.get('_missing')}"
             )
         else:
             self.warning_label.configure(text="")
@@ -63,11 +65,11 @@ class TabDQEExport(ctk.CTkFrame):
         self.structure_box.delete("1.0", "end")
         self.structure_box.insert(
             "end",
-            f"Sections d\u00e9tect\u00e9es: {meta['nb_sections']}\n"
+            f"Sections détectées: {meta['nb_sections']}\n"
             f"Codes prix dans le BPUF: {meta['nb_codes']}\n"
-            f"Codes constat\u00e9s dans l'historique consolid\u00e9: {nb_constates} / {meta['nb_codes']}\n"
-            f"(Un \u00e9cart important entre ces deux nombres est normal : les commandes historiques ne "
-            f"couvrent jamais l'int\u00e9gralit\u00e9 du BPUF \u2014 mode sparse.)\n\n"
+            f"Codes constatés dans l'historique consolidé: {nb_constates} / {meta['nb_codes']}\n"
+            f"(Un écart important entre ces deux nombres est normal : les commandes historiques ne "
+            f"couvrent jamais l'intégralité du BPUF — mode sparse.)\n\n"
         )
         for s in sections:
             nb_codes_section = len([c for c in codes.values() if c.section == s.lettre])
@@ -77,7 +79,7 @@ class TabDQEExport(ctk.CTkFrame):
 
     def generate(self):
         if not self.bpu_path or not self.state.consolidation:
-            self.result_label.configure(text="Consolidation manquante \u2014 passez d'abord par l'onglet 5.")
+            self.result_label.configure(text="Consolidation manquante — passez d'abord par l'onglet 5.")
             return
 
         output_path = app_data_dir() / "output" / "DQE_genere.xlsx"
@@ -90,9 +92,11 @@ class TabDQEExport(ctk.CTkFrame):
         )
         anomalies = verify_formulas(output_path)
         self.result_label.configure(
-            text=f"DQE g\u00e9n\u00e9r\u00e9: {report['output_path']} | {report['nb_codes_constates']} codes constat\u00e9s / "
+            text=f"DQE généré: {report['output_path']} | {report['nb_codes_constates']} codes constatés / "
                  f"{report['nb_codes_bpu']} du BPUF | Anomalies formules: {len(anomalies)}"
         )
 
     def refresh(self):
-        pass
+        if not self.bpu_path_var.get() and getattr(self.state, "bpu_path", None):
+            self.bpu_path = self.state.bpu_path
+            self.bpu_path_var.set(str(self.state.bpu_path))
