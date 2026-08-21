@@ -18,6 +18,7 @@ class AppState:
         self.a_qualifier = []
         self.consolidation = {}
         self.params_estimation = None
+        self.bpu_path = None  # partage le BPUF cible entre l'onglet mapping et l'onglet export
 
 
 class AppWindow(ctk.CTk):
