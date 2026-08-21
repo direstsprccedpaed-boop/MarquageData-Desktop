@@ -6,6 +6,12 @@ from core.paths import app_data_dir
 
 CONFIG_PATH = app_data_dir() / "data" / "mapping_config.json"
 
+# Statuts possibles pour un MappingAlias :
+#   "mappe"       -> correspondance exacte ou validee vers un code du BPUF cible
+#   "conserve"    -> code source conserve tel quel (pas de correspondance BPUF garantie),
+#                    a corriger si besoin directement dans le DQE Excel genere
+#   "a_qualifier" -> aucune decision prise, ligne exclue de la consolidation
+
 
 def load_mapping() -> dict[str, MappingAlias]:
     if not CONFIG_PATH.exists():
@@ -52,11 +58,13 @@ def auto_map_from_bpu(
     Passe 1 (identite) : si un code_prix_source correspond exactement a un code du
     BPUF cible, il est mappe automatiquement vers lui-meme -> aucune saisie requise.
 
-    Passe 2 (suggestion) : pour les codes restants (nomenclature ancienne/differente,
-    ex. PN18), une suggestion est calculee par similarite textuelle entre la
-    designation de la commande et l'intitule court de chaque prix du BPUF. La
-    suggestion est proposee mais reste modifiable/validable par l'utilisateur -
-    elle n'est jamais appliquee automatiquement sans confirmation.
+    Passe 2 (suggestion) : pour les codes restants, une suggestion est calculee par
+    similarite textuelle entre la designation de la commande et l'intitule court de
+    chaque prix du BPUF. La suggestion reste modifiable/validable par l'utilisateur -
+    elle n'est jamais appliquee automatiquement sans confirmation. L'utilisateur peut
+    aussi choisir de conserver le code source tel quel (voir keep_source_code) plutot
+    que de forcer une correspondance BPUF, quitte a corriger directement dans le DQE
+    Excel genere.
 
     Retourne (mapping_mis_a_jour_avec_les_identites, suggestions, codes_sans_suggestion).
     """
@@ -92,14 +100,15 @@ def auto_map_from_bpu(
 def apply_mapping(
     commandes: list[CommandeExtraite], mapping: dict[str, MappingAlias]
 ) -> tuple[list[dict], list[str]]:
-    """Applique le mapping et retourne les lignes enrichies + la liste des codes a qualifier."""
+    """Applique le mapping et retourne les lignes enrichies + la liste des codes a qualifier.
+    Les statuts "mappe" et "conserve" sont tous deux consideres comme resolus."""
     lignes_mappees = []
     a_qualifier: set[str] = set()
     for c in commandes:
         for ligne in c.lignes:
             code_src = ligne.code_prix_source.strip()
             alias = mapping.get(code_src)
-            if alias and alias.statut == "mappe":
+            if alias and alias.statut in ("mappe", "conserve"):
                 code_cible = alias.code_cible
             else:
                 code_cible = code_src
@@ -120,4 +129,23 @@ def apply_mapping(
 
 def upsert_alias(mapping: dict[str, MappingAlias], code_source: str, code_cible: str) -> dict[str, MappingAlias]:
     mapping[code_source] = MappingAlias(code_source=code_source, code_cible=code_cible, statut="mappe")
+    return mapping
+
+
+def keep_source_code(mapping: dict[str, MappingAlias], code_source: str) -> dict[str, MappingAlias]:
+    """Conserve le code source tel quel comme code cible, sans exiger de correspondance
+    BPUF verifiee. Utile quand une correction finale directement dans le DQE Excel est
+    plus rapide/pertinente qu'un mapping precis a la saisie."""
+    mapping[code_source] = MappingAlias(code_source=code_source, code_cible=code_source, statut="conserve")
+    return mapping
+
+
+def keep_all_remaining_as_source(
+    commandes: list[CommandeExtraite], mapping: dict[str, MappingAlias]
+) -> dict[str, MappingAlias]:
+    """Applique keep_source_code() a tous les codes source encore non resolus."""
+    codes = collect_source_codes(commandes)
+    for code in codes:
+        if code not in mapping:
+            mapping = keep_source_code(mapping, code)
     return mapping
