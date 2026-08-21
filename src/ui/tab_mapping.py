@@ -4,12 +4,17 @@ import customtkinter as ctk
 from core.importer import import_json_files, import_json_text_global
 from core.normalizer import (
     load_mapping, save_mapping, collect_source_codes, apply_mapping,
-    upsert_alias, auto_map_from_bpu,
+    upsert_alias, auto_map_from_bpu, keep_source_code, keep_all_remaining_as_source,
 )
 from core.excel_builder import parse_bpu_structure
 
 
-class TabMapping(ctk.CTkFrame):
+class TabMapping(ctk.CTkScrollableFrame):
+    """Onglet entierement defilant : avec le formulaire de mapping et la liste
+    des codes orphelins, le contenu peut depasser la hauteur de la fenetre.
+    Sans scroll sur tout l'onglet, le bouton "Appliquer le mapping" en bas
+    devenait invisible/inaccessible sur les ecrans standards."""
+
     def __init__(self, parent, state, app):
         super().__init__(parent)
         self.state = state
@@ -23,14 +28,14 @@ class TabMapping(ctk.CTkFrame):
 
         ctk.CTkLabel(
             self,
-            text="Collez ici le tableau JSON global renvoyé par votre LLM, PUIS cliquez sur \"Importer le JSON "
+            text="Collez ici le tableau JSON global renvoyé par votre LLM, PUIS cliquez sur \"① Importer le JSON "
                  "collé\" (vérifiez que le message ci-dessous change et affiche un nombre de commandes > 0 avant "
                  "de passer à l'étape suivante). Si plusieurs lots ont été nécessaires (onglet 2), répétez l'import "
                  "pour chaque réponse — les commandes s'accumulent.",
             text_color="gray", wraplength=1050, justify="left",
         ).pack(padx=20, pady=(0, 10), anchor="w")
 
-        self.paste_box = ctk.CTkTextbox(self, width=1100, height=160)
+        self.paste_box = ctk.CTkTextbox(self, width=1080, height=140)
         self.paste_box.pack(padx=20, pady=5)
 
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
@@ -50,25 +55,36 @@ class TabMapping(ctk.CTkFrame):
         bpu_row = ctk.CTkFrame(self, fg_color="transparent")
         bpu_row.pack(fill="x", padx=20, pady=5)
         self.bpu_path_var = ctk.StringVar()
-        ctk.CTkEntry(bpu_row, textvariable=self.bpu_path_var, width=650).pack(side="left", padx=(0, 10), fill="x", expand=True)
+        ctk.CTkEntry(bpu_row, textvariable=self.bpu_path_var, width=580).pack(side="left", padx=(0, 10), fill="x", expand=True)
         ctk.CTkButton(bpu_row, text="Choisir le BPUF cible (.xlsx)…", command=self.browse_bpu).pack(side="left")
         ctk.CTkButton(bpu_row, text="Lancer l'auto-mapping", command=self.run_auto_mapping).pack(side="left", padx=10)
 
         self.auto_summary = ctk.CTkLabel(self, text="", text_color="gray", wraplength=1050, justify="left")
         self.auto_summary.pack(pady=5, anchor="w", padx=20)
 
+        orphan_header_row = ctk.CTkFrame(self, fg_color="transparent")
+        orphan_header_row.pack(fill="x", padx=20, pady=(10, 0))
         ctk.CTkLabel(
-            self,
-            text="Codes restants à qualifier (une suggestion pré-remplie provient de la similarité de désignation — "
-                 "vérifiez-la ou corrigez-la avant de valider)",
-            font=("", 13, "bold"),
-        ).pack(pady=(10, 5))
+            orphan_header_row,
+            text="Codes restants à qualifier. Par défaut, un code SANS suggestion est déjà coché \"conserver tel "
+                 "quel\" (correction possible directement dans le DQE Excel généré). Un code AVEC suggestion est "
+                 "laissé en saisie libre — cochez la case si vous préférez malgré tout le conserver tel quel.",
+            font=("", 13, "bold"), wraplength=850, justify="left",
+        ).pack(side="left")
+        ctk.CTkButton(
+            orphan_header_row, text="Tout conserver tel quel",
+            command=self.keep_all_remaining, fg_color="#8a6d00", hover_color="#6b5400",
+        ).pack(side="right")
 
-        self.mapping_frame = ctk.CTkScrollableFrame(self, width=1100, height=180)
-        self.mapping_frame.pack(padx=20, pady=10, fill="both", expand=True)
+        self.mapping_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.mapping_frame.pack(padx=20, pady=10, fill="x")
         self.mapping_entries: dict[str, ctk.CTkEntry] = {}
+        self.mapping_keep_vars: dict[str, ctk.BooleanVar] = {}
 
-        ctk.CTkButton(self, text="③ Appliquer le mapping (obligatoire avant l'onglet 5)", command=self.apply_mapping_click).pack(pady=10)
+        ctk.CTkButton(
+            self, text="③ APPLIQUER LE MAPPING (obligatoire avant l'onglet 5)",
+            command=self.apply_mapping_click, height=42, font=("", 14, "bold"),
+        ).pack(pady=20)
 
     def import_pasted(self):
         text = self.paste_box.get("1.0", "end").strip()
@@ -151,42 +167,84 @@ class TabMapping(ctk.CTkFrame):
             text=f"BPUF cible : {meta['nb_codes']} codes / {meta['nb_sections']} sections détectés. "
                  f"{nb_auto} code(s) auto-mappé(s) par identité (correspondance exacte avec le BPUF). "
                  f"{len(self.suggestions)} suggestion(s) par similarité de désignation à valider ci-dessous. "
-                 f"{len(sans_suggestion)} code(s) sans aucune suggestion fiable — saisie manuelle nécessaire.",
+                 f"{len(sans_suggestion)} code(s) sans suggestion — déjà pré-cochés \"conserver tel quel\" par défaut.",
             text_color="gray",
         )
         self._refresh_orphans()
 
-        codes = collect_source_codes(self.state.commandes_extraites)
-        orphans_restants = [c for c in codes if c not in self.state.mapping]
-        if not orphans_restants:
-            self.apply_mapping_click()
-            self.auto_summary.configure(
-                text=self.auto_summary.cget("text") + " Tous les codes étaient résolus par identité — le mapping "
-                     "a été appliqué automatiquement, vous pouvez passer à l'onglet 5.",
-                text_color="green",
-            )
+    def keep_all_remaining(self):
+        if not self.state.commandes_extraites:
+            self.auto_summary.configure(text="⚠️ Aucune commande importée à traiter.", text_color="orange")
+            return
+        self.state.mapping = keep_all_remaining_as_source(self.state.commandes_extraites, self.state.mapping)
+        save_mapping(self.state.mapping)
+        self._refresh_orphans()
+        self.apply_mapping_click()
+        self.auto_summary.configure(
+            text=self.auto_summary.cget("text") + " Tous les codes restants ont été conservés tels quels — "
+                 "vérifiez-les/corrigez-les directement dans le DQE Excel généré à l'onglet 6 (section \"HORS BPUF\").",
+            text_color="green",
+        )
 
     def _refresh_orphans(self):
         for widget in self.mapping_frame.winfo_children():
             widget.destroy()
         self.mapping_entries.clear()
+        self.mapping_keep_vars.clear()
 
         codes = collect_source_codes(self.state.commandes_extraites)
         orphans = sorted(c for c in codes if c not in self.state.mapping)
+
+        if not orphans:
+            ctk.CTkLabel(self.mapping_frame, text="Aucun code orphelin en attente.", text_color="gray").pack(anchor="w", pady=5)
+            return
+
         for code in orphans:
             row = ctk.CTkFrame(self.mapping_frame, fg_color="transparent")
-            row.pack(fill="x", pady=2)
+            row.pack(fill="x", pady=3)
             ctk.CTkLabel(row, text=f"{code} → ", width=100).pack(side="left")
-            entry = ctk.CTkEntry(row, placeholder_text="code cible BPUF (ex: J7)")
+
+            suggestion = self.suggestions.get(code)
+            keep_default = suggestion is None  # pas de suggestion -> conserver tel quel par defaut
+
+            entry = ctk.CTkEntry(row, placeholder_text="code cible BPUF (ex: J7)", width=200)
+            if suggestion and not keep_default:
+                entry.insert(0, suggestion)
+            entry.pack(side="left", padx=(0, 10))
+            self.mapping_entries[code] = entry
+
+            if suggestion:
+                ctk.CTkLabel(row, text="(suggéré, à vérifier)", text_color="orange", width=150).pack(side="left")
+            else:
+                ctk.CTkLabel(row, text="(aucune suggestion)", text_color="gray", width=150).pack(side="left")
+
+            keep_var = ctk.BooleanVar(value=keep_default)
+            self.mapping_keep_vars[code] = keep_var
+            ctk.CTkCheckBox(
+                row, text="Conserver le code source tel quel", variable=keep_var,
+                command=lambda c=code, e=entry, v=keep_var: self._on_keep_toggle(c, e, v),
+            ).pack(side="left", padx=10)
+
+            if keep_default:
+                entry.configure(state="disabled", placeholder_text=f"conservé: {code}")
+
+    def _on_keep_toggle(self, code: str, entry: ctk.CTkEntry, keep_var: ctk.BooleanVar):
+        if keep_var.get():
+            entry.delete(0, "end")
+            entry.configure(state="disabled", placeholder_text=f"conservé: {code}")
+        else:
+            entry.configure(state="normal", placeholder_text="code cible BPUF (ex: J7)")
             suggestion = self.suggestions.get(code)
             if suggestion:
+                entry.delete(0, "end")
                 entry.insert(0, suggestion)
-                ctk.CTkLabel(row, text="(suggéré, à vérifier)", text_color="orange").pack(side="left", padx=5)
-            entry.pack(side="left", fill="x", expand=True)
-            self.mapping_entries[code] = entry
 
     def apply_mapping_click(self):
         for code_src, entry in self.mapping_entries.items():
+            keep_var = self.mapping_keep_vars.get(code_src)
+            if keep_var and keep_var.get():
+                self.state.mapping = keep_source_code(self.state.mapping, code_src)
+                continue
             target = entry.get().strip()
             if target:
                 self.state.mapping = upsert_alias(self.state.mapping, code_src, target)
@@ -203,9 +261,12 @@ class TabMapping(ctk.CTkFrame):
         lignes_mappees, a_qualifier = apply_mapping(self.state.commandes_extraites, self.state.mapping)
         self.state.lignes_mappees = lignes_mappees
         self.state.a_qualifier = a_qualifier
+
+        nb_conserves = sum(1 for a in self.state.mapping.values() if a.statut == "conserve")
         self.audit_label.configure(
             text=f"✅ Mapping appliqué : {len(lignes_mappees)} lignes prêtes pour la consolidation | "
-                 f"{len(a_qualifier)} code(s) à qualifier: {', '.join(a_qualifier[:10])}",
+                 f"{nb_conserves} code(s) conservé(s) tel quel (à vérifier dans le DQE final) | "
+                 f"{len(a_qualifier)} code(s) encore à qualifier: {', '.join(a_qualifier[:10])}",
             text_color="white",
         )
         self._refresh_orphans()
