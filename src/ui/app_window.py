@@ -23,10 +23,16 @@ class AppState:
 class AppWindow(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("MarquageData-Desktop \u2014 Pipeline DQE")
+        self.title("MarquageData-Desktop — Pipeline DQE")
         self.geometry("1200x800")
         self.minsize(1000, 700)
-        self.state = AppState()
+
+        # IMPORTANT : ne jamais nommer cet attribut "self.state" sur une
+        # sous-classe de ctk.CTk / tkinter.Tk. Tk expose une methode native
+        # self.state() (gestion normal/zoomed/iconic) que CustomTkinter
+        # appelle en interne (ex: _windows_set_titlebar_color). L'ecraser
+        # avec un objet non appelable provoque un TypeError au mainloop().
+        self.app_state = AppState()
 
         self.tabview = ctk.CTkTabview(self, width=1180, height=770)
         self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
@@ -37,19 +43,19 @@ class AppWindow(ctk.CTk):
         self.tab_aggregation = self.tabview.add("5. Consolidation")
         self.tab_export = self.tabview.add("6. Export DQE")
 
-        self.view_ingest = TabIngest(self.tab_ingest, self.state, self)
+        self.view_ingest = TabIngest(self.tab_ingest, self.app_state, self)
         self.view_ingest.pack(fill="both", expand=True)
 
-        self.view_llm = TabLLM(self.tab_llm, self.state, self)
+        self.view_llm = TabLLM(self.tab_llm, self.app_state, self)
         self.view_llm.pack(fill="both", expand=True)
 
-        self.view_mapping = TabMapping(self.tab_mapping, self.state, self)
+        self.view_mapping = TabMapping(self.tab_mapping, self.app_state, self)
         self.view_mapping.pack(fill="both", expand=True)
 
-        self.view_aggregation = TabAggregation(self.tab_aggregation, self.state, self)
+        self.view_aggregation = TabAggregation(self.tab_aggregation, self.app_state, self)
         self.view_aggregation.pack(fill="both", expand=True)
 
-        self.view_export = TabDQEExport(self.tab_export, self.state, self)
+        self.view_export = TabDQEExport(self.tab_export, self.app_state, self)
         self.view_export.pack(fill="both", expand=True)
 
     def refresh_all(self):
