@@ -18,10 +18,18 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Installation des dependances
+      - name: Installation des dependances (verification explicite du requirements.txt)
         run: |
           python -m pip install --upgrade pip
+          if (!(Test-Path "requirements.txt")) { throw "requirements.txt introuvable a la racine du depot" }
           pip install -r requirements.txt
+          Write-Host "--- Packages installes (pip freeze) ---"
+          pip freeze
+
+      - name: Nettoyage des builds precedents
+        run: |
+          if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
+          if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
 
       - name: Compilation via PyInstaller
         run: |
