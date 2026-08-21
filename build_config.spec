@@ -2,12 +2,16 @@
 from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
+
+# NOTE: numpy/pandas ont ete retires (voir requirements.txt) pour eviter les
+# problemes classiques de bundling des extensions C de numpy en mode --onefile.
 hidden_imports = (
     collect_submodules("pdfplumber")
     + collect_submodules("pypdf")
     + collect_submodules("docx")
     + collect_submodules("openpyxl")
     + collect_submodules("customtkinter")
+    + collect_submodules("PIL")
 )
 
 a = Analysis(
@@ -21,7 +25,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["streamlit", "flask", "fastapi", "uvicorn"],
+    excludes=["streamlit", "flask", "fastapi", "uvicorn", "numpy", "pandas", "scipy", "matplotlib"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
