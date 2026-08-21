@@ -1,4 +1,4 @@
-import os
+import csv
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
@@ -6,7 +6,7 @@ from typing import Callable, Optional
 import pdfplumber
 from pypdf import PdfReader
 import docx
-import pandas as pd
+from openpyxl import load_workbook
 
 from core.models import DocumentIngere
 from core.paths import app_data_dir
@@ -67,25 +67,42 @@ def _extract_docx_text(path: Path) -> str:
 
 
 def _extract_xlsx_text(path: Path) -> str:
+    """Extraction sans pandas : lecture directe via openpyxl, cellule par cellule."""
     try:
-        sheets = pd.read_excel(str(path), sheet_name=None, header=None, engine="openpyxl")
+        wb = load_workbook(str(path), data_only=True, read_only=True)
         parts = []
-        for name, df in sheets.items():
+        for name in wb.sheetnames:
+            ws = wb[name]
             parts.append(f"--- Feuille: {name} ---")
-            parts.append(df.to_csv(index=False, header=False))
+            for row in ws.iter_rows(values_only=True):
+                cells = ["" if v is None else str(v) for v in row]
+                if any(c.strip() for c in cells):
+                    parts.append(",".join(cells))
+        wb.close()
         return "\n".join(parts)
     except Exception as exc:
         return f"[ERREUR EXTRACTION XLSX: {exc}]"
 
 
 def _extract_csv_text(path: Path) -> str:
+    """Extraction sans pandas : detection d'encodage manuelle + module csv natif."""
+    for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+        try:
+            with open(path, "r", encoding=enc, newline="") as f:
+                sample = f.read(4096)
+                f.seek(0)
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=";,\t")
+                except csv.Error:
+                    dialect = csv.excel
+                reader = csv.reader(f, dialect)
+                lines = [",".join(row) for row in reader]
+            return "\n".join(lines)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        except Exception as exc:
+            return f"[ERREUR EXTRACTION CSV: {exc}]"
     try:
-        for enc in ("utf-8", "latin-1", "cp1252"):
-            try:
-                df = pd.read_csv(str(path), sep=None, engine="python", encoding=enc)
-                return df.to_csv(index=False)
-            except Exception:
-                continue
         return path.read_text(errors="ignore")
     except Exception as exc:
         return f"[ERREUR EXTRACTION CSV: {exc}]"
