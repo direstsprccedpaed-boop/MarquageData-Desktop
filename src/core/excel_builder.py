@@ -8,12 +8,13 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from core.models import CodePrixBPU, SectionBPU, LigneConsolidee
 
-# Motif generique acceptant aussi bien les codes "plats" (A1, J7, M8, Y3.1)
-# que les codes hierarchiques a tiret (A1-1, C2-1, G3-4, AA1-2...). Le groupe 1
-# capture le prefixe alphabetique (1 ou 2 lettres) qui servira de cle de
-# regroupement de section, meme quand aucune ligne d'en-tete de section n'est
-# detectee dans le fichier source.
-LEAF_PATTERN = re.compile(r"^([A-Z]{1,2})(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?$")
+# Motif par defaut, agnostique a la profondeur de numerotation : accepte les
+# codes plats (A1, J7, Y3.1) ET les codes hierarchiques a tiret (A1-1, C2-1,
+# AA1-2...). Le groupe 1 capture le prefixe alphabetique qui sert de cle de
+# regroupement de section. Un utilisateur avance peut fournir son propre motif
+# (doit exposer un groupe 1 = prefixe de section, et idealement un groupe
+# optionnel apres un tiret pour la logique bare-vs-hyphen).
+DEFAULT_LEAF_PATTERN = r"^([A-Z]{1,2})(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?$"
 SECTION_TITLE_PATTERN = re.compile(r"^([A-Z]{1,2})$")
 
 KEYWORDS = {
@@ -32,6 +33,35 @@ HORS_BPU_FILL = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type=
 
 def _first_line(value: str) -> str:
     return (value or "").split("\n")[0].strip().lower()
+
+
+def list_sheet_names(path: Path) -> list[str]:
+    wb = load_workbook(str(path), read_only=True)
+    names = list(wb.sheetnames)
+    wb.close()
+    return names
+
+
+def preview_rows(
+    path: Path, sheet_name: str | None = None, header_row: int = 1,
+    max_rows: int = 8, max_cols: int = 12,
+) -> dict:
+    """Retourne un apercu brut (texte tronque) des lignes/colonnes pour aider
+    l'utilisateur a choisir manuellement les colonnes dans l'UI."""
+    wb = load_workbook(str(path), data_only=True)
+    ws = wb[sheet_name] if sheet_name else wb.active
+    header_row = max(1, header_row)
+    end = min(ws.max_row, header_row + max_rows - 1)
+    rows = []
+    for r in range(header_row, end + 1):
+        row_vals = []
+        for c in range(1, max_cols + 1):
+            v = ws.cell(row=r, column=c).value
+            text = "" if v is None else str(v).split("\n")[0]
+            row_vals.append(text[:18])
+        rows.append(row_vals)
+    wb.close()
+    return {"rows": rows, "max_cols": max_cols, "header_row": header_row}
 
 
 def detect_columns(ws: Worksheet, header_row: int = 1, max_col: int = 30) -> dict:
@@ -60,29 +90,56 @@ def detect_columns(ws: Worksheet, header_row: int = 1, max_col: int = 30) -> dic
     return detected
 
 
-def parse_bpu_structure(path: Path, sheet_name: str | None = None) -> tuple[dict[str, CodePrixBPU], list[SectionBPU], dict]:
-    """Parseur agnostique a la profondeur de numerotation du BPUF.
+def parse_bpu_structure(
+    path: Path,
+    sheet_name: str | None = None,
+    header_row: int = 1,
+    column_overrides: dict | None = None,
+    custom_leaf_pattern: str | None = None,
+) -> tuple[dict[str, CodePrixBPU], list[SectionBPU], dict]:
+    """Parseur configurable du BPUF.
 
-    Passe 1 : on releve tous les codes candidats matchant LEAF_PATTERN, qu'ils
-    soient plats (A1) ou a tiret (A1-1).
-    Passe 2 : un code plat (ex "A1") est ecarte des feuilles s'il existe au
-    moins un code a tiret partageant le meme prefixe plat (ex "A1-1", "A1-2")
-    -> c'est alors une ligne de sous-categorie/en-tete, pas un prix reel.
-    Un code plat SANS aucun enfant a tiret (ex "T1", "R1" dans certains BPUF)
-    reste una feuille valide.
-    Les sections sont ensuite reconstituees en regroupant les feuilles
-    consecutives partageant le meme prefixe de lettres, independamment de la
-    presence ou non d'une ligne d'en-tete explicite dans le fichier source.
+    - sheet_name : feuille a lire (par defaut la feuille active).
+    - header_row : numero de la ligne d'en-tete (par defaut 1).
+    - column_overrides : dict optionnel {"numero": idx, "designation": idx,
+      "unite": idx, "pu": idx} (index de colonne 1-based) pour forcer le
+      mapping des colonnes au lieu de la detection automatique par mots-cles.
+    - custom_leaf_pattern : regex optionnelle pour remplacer le motif de
+      reconnaissance des codes prix (doit contenir un groupe 1 = prefixe de
+      section, et idealement un groupe optionnel apres un tiret).
+
+    Detection des feuilles (prix reels) : un code "plat" (ex "A1") est ecarte
+    s'il existe au moins un code a tiret partageant le meme prefixe plat (ex
+    "A1-1") -> c'est alors une ligne de sous-categorie, pas un prix. Les
+    sections sont reconstituees en regroupant les feuilles consecutives
+    partageant le meme prefixe de lettres, sans dependre de la presence d'une
+    ligne d'en-tete de section explicite.
     """
     wb = load_workbook(str(path), data_only=False)
     ws = wb[sheet_name] if sheet_name else wb.active
-    cols = detect_columns(ws)
+
+    if column_overrides:
+        cols = {
+            "numero": column_overrides.get("numero") or 1,
+            "designation": column_overrides.get("designation") or 2,
+            "unite": column_overrides.get("unite") or 3,
+            "pu": column_overrides.get("pu") or 4,
+            "_defaults_used": False,
+            "_missing": [],
+        }
+    else:
+        cols = detect_columns(ws, header_row=header_row)
+
+    try:
+        leaf_pattern = re.compile(custom_leaf_pattern) if custom_leaf_pattern else re.compile(DEFAULT_LEAF_PATTERN)
+    except re.error:
+        leaf_pattern = re.compile(DEFAULT_LEAF_PATTERN)
 
     candidates = []
     section_titles: dict[str, str] = {}
     max_row = ws.max_row
 
-    for row in range(2, max_row + 1):
+    for row in range(header_row + 1, max_row + 1):
         raw_num = str(ws.cell(row=row, column=cols["numero"]).value or "").strip()
         if not raw_num:
             continue
@@ -95,10 +152,12 @@ def parse_bpu_structure(path: Path, sheet_name: str | None = None) -> tuple[dict
                 section_titles[letters] = title_text
             continue
 
-        m = LEAF_PATTERN.match(raw_num)
-        if not m:
+        m = leaf_pattern.match(raw_num)
+        if not m or not m.groups():
             continue
-        letters, num1, num2 = m.group(1), m.group(2), m.group(3)
+        letters = m.group(1)
+        num1 = m.group(2) if len(m.groups()) >= 2 else ""
+        num2 = m.group(3) if len(m.groups()) >= 3 else None
         bare_text = f"{letters}{num1}"
 
         designation_raw = str(ws.cell(row=row, column=cols["designation"]).value or "")
@@ -174,10 +233,15 @@ def generate_dqe_from_bpu(
     qte_defaut_absent: float = 0.0,
     omit_empty_sections: bool = False,
     sheet_name: str | None = None,
+    header_row: int = 1,
+    column_overrides: dict | None = None,
+    custom_leaf_pattern: str | None = None,
 ) -> dict:
-    codes_bpu, sections, meta = parse_bpu_structure(bpu_path, sheet_name)
+    codes_bpu, sections, meta = parse_bpu_structure(
+        bpu_path, sheet_name=sheet_name, header_row=header_row,
+        column_overrides=column_overrides, custom_leaf_pattern=custom_leaf_pattern,
+    )
     section_titles = meta.get("section_titles", {})
-    cols = meta["cols"]
 
     dqe_wb = Workbook()
     dqe_ws = dqe_wb.active
@@ -289,7 +353,7 @@ def generate_dqe_from_bpu(
         "nb_codes_constates": len(consolidation),
         "codes_absents_historique": not_found_in_history,
         "codes_hors_bpu": codes_hors_bpu,
-        "colonnes_detectees": cols,
+        "colonnes_detectees": meta["cols"],
         "output_path": str(output_path),
     }
 
