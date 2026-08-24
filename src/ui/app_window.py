@@ -18,7 +18,11 @@ class AppState:
         self.a_qualifier = []
         self.consolidation = {}
         self.params_estimation = None
-        self.bpu_path = None  # partage le BPUF cible entre l'onglet mapping et l'onglet export
+        self.bpu_path = None            # partage le BPUF cible entre l'onglet mapping et l'onglet export
+        self.bpu_sheet_name = None      # feuille selectionnee dans le classeur BPUF
+        self.bpu_header_row = 1         # ligne d'en-tete (par defaut 1)
+        self.bpu_column_overrides = None  # dict optionnel {"numero":idx, "designation":idx, "unite":idx, "pu":idx}
+        self.bpu_code_pattern = None    # regex optionnelle personnalisee pour la detection des codes prix
 
 
 class AppWindow(ctk.CTk):
