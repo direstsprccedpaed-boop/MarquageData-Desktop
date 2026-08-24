@@ -16,6 +16,51 @@ def _detect_anomalies(commande: CommandeExtraite) -> list[str]:
     return anomalies
 
 
+def build_dedup_key(commande: CommandeExtraite) -> str:
+    """Cle d'identification d'une commande pour la detection de doublons.
+
+    Priorise le numero de commande (identifiant metier stable, ex.
+    "2025-00007338"), qui reste identique meme si le document est re-scanne
+    lors d'une session ulterieure. Le doc_id (qui contient un suffixe
+    aleatoire genere a chaque scan, voir ingest.py) ne sert qu'en repli pour
+    les commandes sans numero renseigne - dans ce cas la detection de doublon
+    entre deux scans distincts n'est pas garantie, c'est une limite connue."""
+    num = (commande.numero_commande or "").strip()
+    return f"NUM::{num}" if num else f"DOC::{commande.doc_id}"
+
+
+def find_duplicates(
+    existing: list[CommandeExtraite], nouvelles: list[CommandeExtraite]
+) -> tuple[list[CommandeExtraite], list[str]]:
+    """Separe les commandes nouvellement importees en (a_ajouter, doublons_ignores).
+
+    Une commande est consideree en doublon si sa cle (voir build_dedup_key)
+    correspond soit a une commande deja presente dans l'etat existant, soit a
+    une autre commande deja rencontree dans ce meme lot en cours d'import
+    (protege aussi contre un lot contenant deux fois la meme commande)."""
+    existing_keys = {build_dedup_key(c) for c in existing}
+    a_ajouter: list[CommandeExtraite] = []
+    doublons: list[str] = []
+    seen_in_batch: set[str] = set()
+
+    for c in nouvelles:
+        key = build_dedup_key(c)
+        if key in existing_keys:
+            doublons.append(
+                f"{c.doc_id} (n\u00b0 commande: {c.numero_commande or 'vide'}) \u2014 d\u00e9j\u00e0 import\u00e9e pr\u00e9c\u00e9demment, ignor\u00e9e"
+            )
+            continue
+        if key in seen_in_batch:
+            doublons.append(
+                f"{c.doc_id} (n\u00b0 commande: {c.numero_commande or 'vide'}) \u2014 doublon interne \u00e0 ce m\u00eame import, ignor\u00e9e"
+            )
+            continue
+        seen_in_batch.add(key)
+        a_ajouter.append(c)
+
+    return a_ajouter, doublons
+
+
 def parse_json_text(raw_text: str) -> tuple[CommandeExtraite | None, list[str]]:
     """Conserve pour compatibilite : parse une reponse JSON representant UNE seule commande."""
     try:
@@ -65,7 +110,10 @@ def parse_json_array(raw_text: str) -> tuple[list[CommandeExtraite], list[str]]:
 
 def import_json_files(paths: list[Path]) -> tuple[list[CommandeExtraite], RapportAudit]:
     """Importe un ou plusieurs fichiers JSON. Chaque fichier peut contenir
-    un tableau de plusieurs commandes (reponse globale) ou une commande unique."""
+    un tableau de plusieurs commandes (reponse globale) ou une commande unique.
+    Note : la deduplication contre les commandes deja en memoire se fait a
+    l'appel de find_duplicates() par l'UI, pas ici (cette fonction reste un
+    pur parseur/validateur sans effet de bord sur l'etat applicatif)."""
     valides: list[CommandeExtraite] = []
     toutes_anomalies: list[str] = []
     total_lignes = 0
