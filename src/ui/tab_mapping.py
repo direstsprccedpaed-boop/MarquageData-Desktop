@@ -7,6 +7,7 @@ from core.normalizer import (
     upsert_alias, auto_map_from_bpu, keep_source_code, keep_all_remaining_as_source,
 )
 from core.excel_builder import parse_bpu_structure
+from ui.bpu_column_picker import BPUColumnPicker
 
 
 class TabMapping(ctk.CTkScrollableFrame):
@@ -58,6 +59,9 @@ class TabMapping(ctk.CTkScrollableFrame):
         ctk.CTkEntry(bpu_row, textvariable=self.bpu_path_var, width=580).pack(side="left", padx=(0, 10), fill="x", expand=True)
         ctk.CTkButton(bpu_row, text="Choisir le BPUF cible (.xlsx)…", command=self.browse_bpu).pack(side="left")
         ctk.CTkButton(bpu_row, text="Lancer l'auto-mapping", command=self.run_auto_mapping).pack(side="left", padx=10)
+
+        self.column_picker = BPUColumnPicker(self, state, app)
+        self.column_picker.pack(fill="x", padx=20, pady=5)
 
         self.auto_summary = ctk.CTkLabel(self, text="", text_color="gray", wraplength=1050, justify="left")
         self.auto_summary.pack(pady=5, anchor="w", padx=20)
@@ -137,6 +141,7 @@ class TabMapping(ctk.CTkScrollableFrame):
             self.bpu_path_var.set(path)
             self.bpu_path = Path(path)
             self.state.bpu_path = self.bpu_path
+            self.column_picker.set_bpu_path(path)
 
     def run_auto_mapping(self):
         if not self.bpu_path_var.get():
@@ -152,8 +157,9 @@ class TabMapping(ctk.CTkScrollableFrame):
 
         self.bpu_path = Path(self.bpu_path_var.get())
         self.state.bpu_path = self.bpu_path
+        overrides = self.column_picker.get_overrides()
 
-        codes_bpu, sections, meta = parse_bpu_structure(self.bpu_path)
+        codes_bpu, sections, meta = parse_bpu_structure(self.bpu_path, **overrides)
         self.codes_bpu = codes_bpu
 
         mapping_avant = len(self.state.mapping)
@@ -163,8 +169,9 @@ class TabMapping(ctk.CTkScrollableFrame):
         save_mapping(self.state.mapping)
         nb_auto = len(self.state.mapping) - mapping_avant
 
+        mode_txt = "manuel (colonnes/motif personnalisés)" if (overrides.get("column_overrides") or overrides.get("custom_leaf_pattern")) else "automatique"
         self.auto_summary.configure(
-            text=f"BPUF cible : {meta['nb_codes']} codes / {meta['nb_sections']} sections détectés. "
+            text=f"BPUF cible (mode {mode_txt}) : {meta['nb_codes']} codes / {meta['nb_sections']} sections détectés. "
                  f"{nb_auto} code(s) auto-mappé(s) par identité (correspondance exacte avec le BPUF). "
                  f"{len(self.suggestions)} suggestion(s) par similarité de désignation à valider ci-dessous. "
                  f"{len(sans_suggestion)} code(s) sans suggestion — déjà pré-cochés \"conserver tel quel\" par défaut.",
@@ -205,7 +212,7 @@ class TabMapping(ctk.CTkScrollableFrame):
             ctk.CTkLabel(row, text=f"{code} → ", width=100).pack(side="left")
 
             suggestion = self.suggestions.get(code)
-            keep_default = suggestion is None  # pas de suggestion -> conserver tel quel par defaut
+            keep_default = suggestion is None
 
             entry = ctk.CTkEntry(row, placeholder_text="code cible BPUF (ex: J7)", width=200)
             if suggestion and not keep_default:
