@@ -1,7 +1,7 @@
 from pathlib import Path
 from tkinter import filedialog
 import customtkinter as ctk
-from core.importer import import_json_files, import_json_text_global
+from core.importer import import_json_files, import_json_text_global, find_duplicates
 from core.normalizer import (
     load_mapping, save_mapping, collect_source_codes, apply_mapping,
     upsert_alias, auto_map_from_bpu, keep_source_code, keep_all_remaining_as_source,
@@ -32,7 +32,8 @@ class TabMapping(ctk.CTkScrollableFrame):
             text="Collez ici le tableau JSON global renvoyé par votre LLM, PUIS cliquez sur \"① Importer le JSON "
                  "collé\" (vérifiez que le message ci-dessous change et affiche un nombre de commandes > 0 avant "
                  "de passer à l'étape suivante). Si plusieurs lots ont été nécessaires (onglet 2), répétez l'import "
-                 "pour chaque réponse — les commandes s'accumulent.",
+                 "pour chaque réponse — les commandes s'accumulent. Les doublons (même numéro de commande déjà "
+                 "importé) sont détectés et écartés automatiquement.",
             text_color="gray", wraplength=1050, justify="left",
         ).pack(padx=20, pady=(0, 10), anchor="w")
 
@@ -45,8 +46,19 @@ class TabMapping(ctk.CTkScrollableFrame):
         ctk.CTkButton(btn_row, text="Ou sélectionner fichier(s) JSON…", command=self.import_files).pack(side="left", padx=10)
         ctk.CTkButton(btn_row, text="Réinitialiser les commandes importées", command=self.reset_commandes).pack(side="left", padx=10)
 
+        dedup_row = ctk.CTkFrame(self, fg_color="transparent")
+        dedup_row.pack(fill="x", padx=20, pady=(0, 5))
+        self.force_duplicates_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            dedup_row, text="Forcer l'import même en cas de doublon détecté (déconseillé, à utiliser au cas par cas)",
+            variable=self.force_duplicates_var,
+        ).pack(side="left")
+
         self.audit_label = ctk.CTkLabel(self, text="⚠️ Aucun import effectué pour l'instant.", justify="left", wraplength=1050, text_color="orange")
         self.audit_label.pack(pady=5, anchor="w", padx=20)
+
+        self.duplicates_label = ctk.CTkLabel(self, text="", justify="left", wraplength=1050, text_color="#e0a030")
+        self.duplicates_label.pack(pady=(0, 5), anchor="w", padx=20)
 
         ctk.CTkLabel(
             self, text="② Auto-mapping via le BPUF cible (les commandes reprennent souvent déjà la nomenclature du DQE)",
@@ -90,6 +102,16 @@ class TabMapping(ctk.CTkScrollableFrame):
             command=self.apply_mapping_click, height=42, font=("", 14, "bold"),
         ).pack(pady=20)
 
+    def _dedupe_and_extend(self, commandes: list) -> tuple[list, list[str]]:
+        """Filtre les doublons (sauf si l'utilisateur a coche "forcer") puis
+        ajoute les commandes retenues a l'etat applicatif."""
+        if self.force_duplicates_var.get():
+            self.state.commandes_extraites.extend(commandes)
+            return commandes, []
+        a_ajouter, doublons = find_duplicates(self.state.commandes_extraites, commandes)
+        self.state.commandes_extraites.extend(a_ajouter)
+        return a_ajouter, doublons
+
     def import_pasted(self):
         text = self.paste_box.get("1.0", "end").strip()
         if not text:
@@ -99,8 +121,8 @@ class TabMapping(ctk.CTkScrollableFrame):
             )
             return
         commandes, rapport = import_json_text_global(text)
-        self.state.commandes_extraites.extend(commandes)
-        self._update_audit(commandes, rapport)
+        ajoutees, doublons = self._dedupe_and_extend(commandes)
+        self._update_audit(ajoutees, rapport, doublons)
         self.paste_box.delete("1.0", "end")
         self._refresh_orphans()
 
@@ -109,30 +131,43 @@ class TabMapping(ctk.CTkScrollableFrame):
         if not paths:
             return
         commandes, rapport = import_json_files([Path(p) for p in paths])
-        self.state.commandes_extraites.extend(commandes)
-        self._update_audit(commandes, rapport)
+        ajoutees, doublons = self._dedupe_and_extend(commandes)
+        self._update_audit(ajoutees, rapport, doublons)
         self._refresh_orphans()
 
-    def _update_audit(self, commandes, rapport):
+    def _update_audit(self, ajoutees, rapport, doublons: list[str]):
         total_now = len(self.state.commandes_extraites)
-        if not commandes and not rapport.anomalies:
+        if not ajoutees and not rapport.anomalies and not doublons:
             self.audit_label.configure(
                 text="⚠️ Aucune commande valide extraite de ce texte — vérifiez que le JSON collé est bien "
                      "un tableau [ {...}, {...} ] conforme au schéma attendu.",
                 text_color="orange",
             )
+            self.duplicates_label.configure(text="")
             return
-        color = "orange" if not commandes else "white"
+
+        color = "orange" if not ajoutees else "white"
         self.audit_label.configure(
-            text=f"+{len(commandes)} commande(s) valide(s) ajoutée(s) (total cumulé: {total_now}) | "
+            text=f"+{len(ajoutees)} commande(s) valide(s) ajoutée(s) (total cumulé: {total_now}) | "
                  f"{rapport.total_lignes} ligne(s) sur cet import | "
                  f"{len(rapport.anomalies)} anomalie(s): {'; '.join(rapport.anomalies[:5])}",
             text_color=color,
         )
 
+        if doublons:
+            self.duplicates_label.configure(
+                text=f"🔁 {len(doublons)} doublon(s) détecté(s) et ignoré(s) automatiquement (même numéro de "
+                     f"commande déjà importé) : {'; '.join(doublons[:5])}"
+                     f"{' ...' if len(doublons) > 5 else ''} — cochez \"Forcer l'import\" ci-dessus si l'un "
+                     f"d'eux doit malgré tout être réimporté."
+            )
+        else:
+            self.duplicates_label.configure(text="")
+
     def reset_commandes(self):
         self.state.commandes_extraites = []
         self.audit_label.configure(text="⚠️ Commandes importées réinitialisées — recollez et importez le JSON.", text_color="orange")
+        self.duplicates_label.configure(text="")
         self._refresh_orphans()
 
     def browse_bpu(self):
