@@ -2,21 +2,32 @@ import re
 import copy
 from pathlib import Path
 from openpyxl import load_workbook, Workbook
+from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from core.models import CodePrixBPU, SectionBPU, LigneConsolidee
 
-SECTION_PATTERN = re.compile(r"^\s*([A-Z]{1,2})\s*[-\u2013]\s")
-CODE_PATTERN = re.compile(r"^([A-Z]{1,2})(\d+(?:\.\d+)?)$")
+# Motif generique acceptant aussi bien les codes "plats" (A1, J7, M8, Y3.1)
+# que les codes hierarchiques a tiret (A1-1, C2-1, G3-4, AA1-2...). Le groupe 1
+# capture le prefixe alphabetique (1 ou 2 lettres) qui servira de cle de
+# regroupement de section, meme quand aucune ligne d'en-tete de section n'est
+# detectee dans le fichier source.
+LEAF_PATTERN = re.compile(r"^([A-Z]{1,2})(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?$")
+SECTION_TITLE_PATTERN = re.compile(r"^([A-Z]{1,2})$")
 
 KEYWORDS = {
-    "numero": ["n\u00b0 de prix", "n de prix", "numero de prix", "code prix", "n\u00b0prix"],
+    "numero": [
+        "n\u00b0 de prix", "n de prix", "numero de prix", "code prix",
+        "n\u00b0prix", "n\u00b0 prix", "n prix",
+    ],
     "designation": ["designation", "d\u00e9signation", "libelle", "libell\u00e9"],
     "unite": ["unite", "unit\u00e9", "unites", "unit\u00e9s"],
     "pu": ["prix unitaire", "p.u.", "pu ht", "pu (ht)"],
 }
 EXCLUDE_PU = ["designation", "d\u00e9signation", "en toutes lettres"]
+
+HORS_BPU_FILL = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
 
 
 def _first_line(value: str) -> str:
@@ -50,54 +61,99 @@ def detect_columns(ws: Worksheet, header_row: int = 1, max_col: int = 30) -> dic
 
 
 def parse_bpu_structure(path: Path, sheet_name: str | None = None) -> tuple[dict[str, CodePrixBPU], list[SectionBPU], dict]:
+    """Parseur agnostique a la profondeur de numerotation du BPUF.
+
+    Passe 1 : on releve tous les codes candidats matchant LEAF_PATTERN, qu'ils
+    soient plats (A1) ou a tiret (A1-1).
+    Passe 2 : un code plat (ex "A1") est ecarte des feuilles s'il existe au
+    moins un code a tiret partageant le meme prefixe plat (ex "A1-1", "A1-2")
+    -> c'est alors une ligne de sous-categorie/en-tete, pas un prix reel.
+    Un code plat SANS aucun enfant a tiret (ex "T1", "R1" dans certains BPUF)
+    reste una feuille valide.
+    Les sections sont ensuite reconstituees en regroupant les feuilles
+    consecutives partageant le meme prefixe de lettres, independamment de la
+    presence ou non d'une ligne d'en-tete explicite dans le fichier source.
+    """
     wb = load_workbook(str(path), data_only=False)
     ws = wb[sheet_name] if sheet_name else wb.active
     cols = detect_columns(ws)
 
-    codes: dict[str, CodePrixBPU] = {}
-    sections: list[SectionBPU] = []
-    current_section: str | None = None
-    section_start_row: int | None = None
-
+    candidates = []
+    section_titles: dict[str, str] = {}
     max_row = ws.max_row
+
     for row in range(2, max_row + 1):
-        num_cell = ws.cell(row=row, column=cols["numero"]).value
-        text_candidate = str(num_cell or "").strip()
-        match_section = SECTION_PATTERN.match(text_candidate) or (
-            SECTION_PATTERN.match(str(ws.cell(row=row, column=cols["designation"]).value or ""))
-        )
-        if match_section:
-            if current_section is not None and section_start_row is not None:
-                sections.append(SectionBPU(
-                    lettre=current_section, ligne_entete=section_start_row,
-                    ligne_debut=section_start_row + 1, ligne_fin=row - 1,
-                ))
-            current_section = match_section.group(1)
-            section_start_row = row
+        raw_num = str(ws.cell(row=row, column=cols["numero"]).value or "").strip()
+        if not raw_num:
             continue
 
-        code_match = CODE_PATTERN.match(text_candidate)
-        if code_match and current_section:
-            designation_raw = str(ws.cell(row=row, column=cols["designation"]).value or "")
-            intitule_court = _first_line(designation_raw).split("pu :")[0].split("l'heure")[0].strip() or designation_raw.strip()
-            unite = str(ws.cell(row=row, column=cols["unite"]).value or "").strip()
-            pu_val = ws.cell(row=row, column=cols["pu"]).value
-            try:
-                pu_ref = float(pu_val) if pu_val is not None else 0.0
-            except (TypeError, ValueError):
-                pu_ref = 0.0
-            codes[text_candidate] = CodePrixBPU(
-                code=text_candidate, intitule_court=intitule_court, unite=unite,
-                pu_reference=pu_ref, section=current_section, ligne_source=row,
-            )
+        title_match = SECTION_TITLE_PATTERN.match(raw_num)
+        if title_match:
+            letters = title_match.group(1)
+            title_text = str(ws.cell(row=row, column=cols["designation"]).value or "").strip()
+            if letters not in section_titles and title_text:
+                section_titles[letters] = title_text
+            continue
 
-    if current_section is not None and section_start_row is not None:
+        m = LEAF_PATTERN.match(raw_num)
+        if not m:
+            continue
+        letters, num1, num2 = m.group(1), m.group(2), m.group(3)
+        bare_text = f"{letters}{num1}"
+
+        designation_raw = str(ws.cell(row=row, column=cols["designation"]).value or "")
+        unite = str(ws.cell(row=row, column=cols["unite"]).value or "").strip()
+        pu_val = ws.cell(row=row, column=cols["pu"]).value
+        try:
+            pu_ref = float(pu_val) if pu_val is not None else 0.0
+        except (TypeError, ValueError):
+            pu_ref = 0.0
+
+        candidates.append({
+            "row": row, "code": raw_num, "bare": bare_text, "letters": letters,
+            "has_hyphen": num2 is not None, "designation": designation_raw,
+            "unite": unite, "pu": pu_ref,
+        })
+
+    bare_with_children = {c["bare"] for c in candidates if c["has_hyphen"]}
+    leaves = [c for c in candidates if c["has_hyphen"] or c["bare"] not in bare_with_children]
+
+    codes: dict[str, CodePrixBPU] = {}
+    for c in leaves:
+        intitule_court = (
+            _first_line(c["designation"]).split("pu :")[0].split("l'heure")[0].strip()
+            or c["designation"].strip()
+        )
+        codes[c["code"]] = CodePrixBPU(
+            code=c["code"], intitule_court=intitule_court, unite=c["unite"],
+            pu_reference=c["pu"], section=c["letters"], ligne_source=c["row"],
+        )
+
+    sections: list[SectionBPU] = []
+    if leaves:
+        current_letters = leaves[0]["letters"]
+        section_first_row = leaves[0]["row"]
+        section_last_row = leaves[0]["row"]
+        for c in leaves[1:]:
+            if c["letters"] == current_letters:
+                section_last_row = c["row"]
+                continue
+            sections.append(SectionBPU(
+                lettre=current_letters, ligne_entete=section_first_row,
+                ligne_debut=section_first_row, ligne_fin=section_last_row,
+            ))
+            current_letters = c["letters"]
+            section_first_row = c["row"]
+            section_last_row = c["row"]
         sections.append(SectionBPU(
-            lettre=current_section, ligne_entete=section_start_row,
-            ligne_debut=section_start_row + 1, ligne_fin=max_row,
+            lettre=current_letters, ligne_entete=section_first_row,
+            ligne_debut=section_first_row, ligne_fin=section_last_row,
         ))
 
-    meta = {"cols": cols, "nb_sections": len(sections), "nb_codes": len(codes)}
+    meta = {
+        "cols": cols, "nb_sections": len(sections), "nb_codes": len(codes),
+        "section_titles": section_titles,
+    }
     wb.close()
     return codes, sections, meta
 
@@ -120,8 +176,7 @@ def generate_dqe_from_bpu(
     sheet_name: str | None = None,
 ) -> dict:
     codes_bpu, sections, meta = parse_bpu_structure(bpu_path, sheet_name)
-    src_wb = load_workbook(str(bpu_path), data_only=False)
-    src_ws = src_wb[sheet_name] if sheet_name else src_wb.active
+    section_titles = meta.get("section_titles", {})
     cols = meta["cols"]
 
     dqe_wb = Workbook()
@@ -143,10 +198,9 @@ def generate_dqe_from_bpu(
         if omit_empty_sections and not any(c in consolidation for c in codes_section):
             continue
 
-        src_header_cell = src_ws.cell(row=section.ligne_entete, column=cols["numero"])
-        header_row_idx = current_row
-        dqe_ws.cell(row=current_row, column=1, value=src_header_cell.value)
-        _copy_style(src_header_cell, dqe_ws.cell(row=current_row, column=1))
+        titre = section_titles.get(section.lettre, f"SECTION {section.lettre}")
+        header_cell = dqe_ws.cell(row=current_row, column=1, value=titre)
+        header_cell.font = header_cell.font.copy(bold=True)
         current_row += 1
         section_start = current_row
 
@@ -164,7 +218,7 @@ def generate_dqe_from_bpu(
             dqe_ws.cell(row=current_row, column=2, value=bpu_info.intitule_court)
             dqe_ws.cell(row=current_row, column=3, value=bpu_info.unite)
             pu_cell = dqe_ws.cell(row=current_row, column=4, value=round(pu, 4))
-            qte_cell = dqe_ws.cell(row=current_row, column=5, value=round(qte, 3))
+            dqe_ws.cell(row=current_row, column=5, value=round(qte, 3))
             total_cell = dqe_ws.cell(row=current_row, column=6, value=f"=D{current_row}*E{current_row}")
 
             pu_cell.number_format = "#,##0.00 \u20ac"
@@ -186,24 +240,55 @@ def generate_dqe_from_bpu(
             current_row += 1
         current_row += 1
 
+    codes_hors_bpu = sorted(c for c in consolidation if c not in codes_bpu)
+    if codes_hors_bpu:
+        dqe_ws.cell(row=current_row, column=1, value="HORS BPUF - A VERIFIER / CORRIGER MANUELLEMENT")
+        for col_idx in range(1, 7):
+            dqe_ws.cell(row=current_row, column=col_idx).fill = HORS_BPU_FILL
+        current_row += 1
+        hors_bpu_start = current_row
+
+        for code in codes_hors_bpu:
+            consolide = consolidation[code]
+            dqe_ws.cell(row=current_row, column=1, value=code)
+            dqe_ws.cell(row=current_row, column=2, value=consolide.designation)
+            dqe_ws.cell(row=current_row, column=3, value=consolide.unite)
+            pu_cell = dqe_ws.cell(row=current_row, column=4, value=round(consolide.pu_dqe, 4))
+            dqe_ws.cell(row=current_row, column=5, value=round(consolide.qte_dqe, 3))
+            total_cell = dqe_ws.cell(row=current_row, column=6, value=f"=D{current_row}*E{current_row}")
+            pu_cell.number_format = "#,##0.00 \u20ac"
+            total_cell.number_format = "#,##0.00 \u20ac"
+            for col_idx in range(1, 7):
+                dqe_ws.cell(row=current_row, column=col_idx).fill = HORS_BPU_FILL
+            current_row += 1
+
+        hors_bpu_end = current_row - 1
+        dqe_ws.cell(row=current_row, column=2, value="TOTAL HORS BPUF")
+        total_hors_bpu_cell = dqe_ws.cell(row=current_row, column=6, value=f"=SUM(F{hors_bpu_start}:F{hors_bpu_end})")
+        total_hors_bpu_cell.number_format = "#,##0.00 \u20ac"
+        for col_idx in range(1, 7):
+            dqe_ws.cell(row=current_row, column=col_idx).fill = HORS_BPU_FILL
+        section_totals.append(("HORS_BPU", current_row))
+        current_row += 2
+
     if section_totals:
         formula = "=" + "+".join(f"F{row}" for _, row in section_totals)
         dqe_ws.cell(row=current_row, column=2, value="TOTAL GENERAL HT")
         total_general_cell = dqe_ws.cell(row=current_row, column=6, value=formula)
         total_general_cell.number_format = "#,##0.00 \u20ac"
 
-    for col_idx, width in enumerate([12, 45, 10, 15, 12, 15], start=1):
+    for col_idx, width in enumerate([12, 55, 10, 15, 12, 15], start=1):
         dqe_ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     dqe_wb.save(str(output_path))
-    src_wb.close()
 
     return {
         "nb_sections": len(sections),
         "nb_codes_bpu": len(codes_bpu),
         "nb_codes_constates": len(consolidation),
         "codes_absents_historique": not_found_in_history,
+        "codes_hors_bpu": codes_hors_bpu,
         "colonnes_detectees": cols,
         "output_path": str(output_path),
     }
