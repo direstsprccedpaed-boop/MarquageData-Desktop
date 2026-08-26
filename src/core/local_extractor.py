@@ -27,6 +27,32 @@ NUM_COMMANDE_PATTERN = re.compile(r"(?:n\u00b0|num[e\u00e9]ro)\s*(?:de\s*)?comma
 SECTEUR_PATTERN = re.compile(r"(CEI\s+[A-Z\u00c9\u00c8\u00c0][\w\-\s]{2,30}|SREX[\-\s]?\w*)", re.IGNORECASE)
 NUM_VALUE_PATTERN = re.compile(r"-?\d+(?:[.,]\d+)?")
 
+# Cascade de reglages pdfplumber, du plus rapide/fiable (bordures reelles) au
+# plus tolerant (texte positionne sans bordures). Issue de la comparaison
+# documentee de la communaute pdfplumber : la strategie "text" avec des
+# tolerances ajustees resout la grande majorite des tableaux sans traits de
+# grille detectables (cas des bons de commande administratifs).
+PDF_TABLE_SETTINGS_PRESETS = [
+    None,  # reglages par defaut de pdfplumber (strategie "lines") - inchange, gagnant sur les PDF a vraies bordures
+    {
+        "vertical_strategy": "text", "horizontal_strategy": "text",
+        "snap_tolerance": 3, "join_tolerance": 3,
+        "intersection_x_tolerance": 5, "intersection_y_tolerance": 5,
+        "min_words_vertical": 2, "min_words_horizontal": 1,
+    },
+    {
+        "vertical_strategy": "text", "horizontal_strategy": "text",
+        "snap_tolerance": 8, "join_tolerance": 10,
+        "intersection_x_tolerance": 10, "intersection_y_tolerance": 10,
+        "min_words_vertical": 1, "min_words_horizontal": 1,
+    },
+    {
+        "vertical_strategy": "text", "horizontal_strategy": "lines",
+        "snap_tolerance": 5, "join_tolerance": 5,
+        "min_words_vertical": 1, "min_words_horizontal": 1,
+    },
+]
+
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
@@ -35,6 +61,11 @@ def _normalize(text: str) -> str:
 def fingerprint_header(header: list[str]) -> str:
     normalized = "|".join(_normalize(h) for h in header)
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _table_signature(table: list[list[str]]) -> str:
+    flat = "||".join(",".join(row) for row in table)
+    return hashlib.sha1(flat.encode("utf-8")).hexdigest()
 
 
 def load_templates() -> dict:
@@ -137,22 +168,11 @@ def extract_tables_docx(path: Path) -> list[list[list[str]]]:
 
 
 def extract_table_by_words_pdf(path: Path, y_tolerance: float = 3.0, x_tolerance: float = 14.0) -> list[list[list[str]]]:
-    """Reconstruction de tableau par position des mots (coordonnees x0/top),
-    independamment de toute detection de grille/bordures.
-
-    Necessaire car de nombreux bons de commande administratifs positionnent
-    le texte en blocs (colonnes visuelles) sans veritables traits de tableau :
-    pdfplumber.extract_tables() lit alors le contenu dans un ordre plus ou
-    moins colonne-par-colonne au lieu de ligne-par-ligne, ce qui desynchronise
-    quantites/prix par rapport aux codes/designations. Confirme sur un cas
-    reel (bon de commande DIR Est, page 2 : la table N\u00b0 de prix/Designation/
-    Unite/Qtes/Prix unitaire sortait de extract_tables() avec les quantites et
-    prix totaux completement decorreles de leur ligne d'origine).
-
-    Principe : regrouper les mots en lignes par proximite verticale, deduire
-    les positions de colonnes ("slots") a partir de la distribution globale
-    des coordonnees x0 de la page, puis reaffecter chaque mot a la colonne la
-    plus proche en concatenant les mots d'une meme cellule."""
+    """Dernier recours (tier 3 artisanal) : reconstruction par position de
+    mots quand aucun preset natif de pdfplumber n'a produit de table
+    exploitable. Conserve pour les cas les plus degrades, mais n'est plus le
+    mecanisme principal - voir PDF_TABLE_SETTINGS_PRESETS pour la strategie
+    prioritaire, plus fiable car basee sur l'algorithme natif de pdfplumber."""
     tables: list[list[list[str]]] = []
     with pdfplumber.open(str(path)) as pdf:
         for page in pdf.pages:
@@ -200,27 +220,43 @@ def extract_table_by_words_pdf(path: Path, y_tolerance: float = 3.0, x_tolerance
 
 
 def extract_tables_pdf(path: Path) -> list[list[list[str]]]:
-    """Combine deux strategies d'extraction PDF concurrentes : la detection
-    de grille classique de pdfplumber (fiable quand le PDF a de vraies
-    bordures de cellules), et une reconstruction par position de mots
-    (fiable quand le tableau est fait de blocs de texte positionnes, sans
-    bordures detectables). Les candidats des deux methodes sont ensuite
-    departages par le systeme de score commun (select_best_table) - aucune
-    des deux methodes n'est privilegiee a priori."""
+    """Cascade multi-strategie : essaie plusieurs presets de reglages natifs
+    pdfplumber (du plus strict/rapide au plus tolerant), collecte tous les
+    candidats produits (dedupliques), puis y ajoute en dernier recours la
+    reconstruction par position de mots. Le systeme de score existant
+    (select_best_table) departage ensuite l'ensemble des candidats issus de
+    toutes les strategies - aucune n'est privilegiee a priori, celle qui
+    produit le tableau le plus coherent gagne."""
     tables: list[list[list[str]]] = []
+    seen_signatures: set[str] = set()
+
     try:
         with pdfplumber.open(str(path)) as pdf:
             for page in pdf.pages:
-                for raw_table in page.extract_tables() or []:
-                    rows = [["" if c is None else str(c).strip() for c in row] for row in raw_table]
-                    rows = [r for r in rows if any(c.strip() for c in r)]
-                    if rows:
+                for settings in PDF_TABLE_SETTINGS_PRESETS:
+                    try:
+                        raw_tables = page.extract_tables(table_settings=settings) if settings else page.extract_tables()
+                    except Exception:
+                        continue
+                    for raw_table in raw_tables or []:
+                        rows = [["" if c is None else str(c).strip() for c in row] for row in raw_table]
+                        rows = [r for r in rows if any(c.strip() for c in r)]
+                        if not rows:
+                            continue
+                        sig = _table_signature(rows)
+                        if sig in seen_signatures:
+                            continue
+                        seen_signatures.add(sig)
                         tables.append(rows)
     except Exception:
         pass
 
     try:
-        tables.extend(extract_table_by_words_pdf(path))
+        for t in extract_table_by_words_pdf(path):
+            sig = _table_signature(t)
+            if sig not in seen_signatures:
+                seen_signatures.add(sig)
+                tables.append(t)
     except Exception:
         pass
 
