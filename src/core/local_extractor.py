@@ -14,8 +14,6 @@ from core.paths import app_data_dir
 
 TEMPLATES_PATH = app_data_dir() / "data" / "extraction_templates.json"
 
-# Mots-cles generiques (aucun metier code en dur) pour deviner le role de
-# chaque colonne d'un tableau de lignes de commande.
 LINE_KEYWORDS = {
     "code": ["code prix", "n\u00b0 prix", "n prix", "reference", "r\u00e9f\u00e9rence", "r\u00e9f.", "article", "code"],
     "designation": ["designation", "d\u00e9signation", "libelle", "libell\u00e9", "intitul\u00e9", "d\u00e9nomination"],
@@ -51,9 +49,6 @@ def save_templates(templates: dict) -> None:
 
 
 def confirm_template(fingerprint: str, header: list[str], mapping: dict) -> None:
-    """Enregistre durablement le mapping valide par l'utilisateur pour cette
-    empreinte d'en-tete : tous les documents futurs partageant la meme mise
-    en page seront traites automatiquement, sans nouvelle validation."""
     templates = load_templates()
     templates[fingerprint] = {"header": header, "mapping": mapping}
     save_templates(templates)
@@ -85,6 +80,8 @@ def _parse_number(raw) -> Optional[float]:
     if raw is None:
         return None
     text = str(raw).strip().replace("\u00a0", "").replace(" ", "")
+    if not text:
+        return None
     text = text.replace(",", ".")
     m = NUM_VALUE_PATTERN.search(text)
     if not m:
@@ -179,8 +176,86 @@ def extract_metadata(texte: str) -> dict:
     return {"numero_commande": numero_commande, "date_commande": date_commande, "secteur": secteur}
 
 
+def _keyword_score(row: list[str]) -> tuple[int, dict]:
+    mapping = detect_line_columns(row)
+    score = sum(1 for v in mapping.values() if v is not None)
+    return score, mapping
+
+
+def _numeric_evidence(table: list[list[str]], header_idx: int, max_check_rows: int = 10) -> int:
+    """Compte le nombre de colonnes contenant des valeurs numeriques plausibles
+    sur plusieurs lignes de donnees consecutives - signe fort d'une vraie table
+    de lignes de commande (quantite/prix) par opposition a une table de page
+    de garde (MOA, dates, duree) qui contient surtout du texte ou des cellules
+    vides."""
+    data_rows = table[header_idx + 1: header_idx + 1 + max_check_rows]
+    if not data_rows:
+        return 0
+    nb_cols = max((len(r) for r in data_rows), default=0)
+    numeric_cols = 0
+    for col in range(nb_cols):
+        values = [r[col] for r in data_rows if col < len(r) and r[col].strip()]
+        if not values:
+            continue
+        numeric_count = sum(1 for v in values if _parse_number(v) is not None)
+        if numeric_count >= max(2, (len(values) + 1) // 2):
+            numeric_cols += 1
+    return numeric_cols
+
+
+def find_header_row(table: list[list[str]], max_scan: int = 4) -> tuple[int, int, dict]:
+    """Cherche, parmi les premieres lignes de la table, celle qui ressemble le
+    plus a un en-tete de tableau de lignes de commande (meilleur score de
+    mots-cles), plutot que de supposer aveuglement que la premiere ligne est
+    l'en-tete (souvent faux en presence de cellules fusionnees/page de garde)."""
+    best_idx, best_score, best_mapping = 0, -1, {}
+    for idx in range(min(max_scan, len(table))):
+        score, mapping = _keyword_score(table[idx])
+        if score > best_score:
+            best_idx, best_score, best_mapping = idx, score, mapping
+    return best_idx, best_score, best_mapping
+
+
+def score_candidate_table(table: list[list[str]]) -> dict:
+    header_idx, kw_score, mapping = find_header_row(table)
+    numeric_cols = _numeric_evidence(table, header_idx)
+    nb_data_rows = len(table) - header_idx - 1
+    total_cells = sum(len(row) for row in table) or 1
+    non_empty_cells = sum(1 for row in table for c in row if c.strip())
+    non_empty_ratio = non_empty_cells / total_cells
+
+    total_score = (kw_score * 3) + (numeric_cols * 2) + (1 if nb_data_rows >= 2 else -3)
+    if non_empty_ratio < 0.15:
+        total_score -= 5
+
+    return {
+        "header_idx": header_idx, "kw_score": kw_score, "mapping": mapping,
+        "numeric_cols": numeric_cols, "nb_data_rows": nb_data_rows,
+        "non_empty_ratio": round(non_empty_ratio, 2), "total_score": total_score,
+    }
+
+
+def select_best_table(tables: list[list[list[str]]]) -> tuple[Optional[list[list[str]]], Optional[dict]]:
+    """Choisit, parmi tous les tableaux detectes dans le document (une page de
+    garde recapitulative en produit souvent une, la vraie liste de prix une
+    autre), celui qui ressemble le plus a une table de lignes de commande.
+    Si le meilleur candidat n'atteint pas un seuil minimal de confiance
+    (aucun mot-cle reconnu ET moins de 2 colonnes numeriques), on considere
+    qu'aucune table fiable n'a ete trouvee plutot que de proposer une
+    validation sur du bruit."""
+    if not tables:
+        return None, None
+    scored = [(t, score_candidate_table(t)) for t in tables]
+    scored.sort(key=lambda x: x[1]["total_score"], reverse=True)
+    best_table, best_info = scored[0]
+    if best_info["kw_score"] < 1 and best_info["numeric_cols"] < 2:
+        return None, best_info
+    return best_table, best_info
+
+
 def extract_lines_from_table(table: list[list[str]], mapping: dict) -> tuple[list[LigneCommande], int]:
-    """Retourne (lignes_valides, nb_lignes_ignorees). Une ligne est ignoree si
+    """table doit commencer par la ligne d'en-tete (index 0 = en-tete).
+    Retourne (lignes_valides, nb_lignes_ignorees). Une ligne est ignoree si
     le code est vide ou si la quantite/le PU ne sont pas des nombres
     exploitables - jamais devinee ou inventee."""
     lignes: list[LigneCommande] = []
@@ -219,12 +294,11 @@ def extract_lines_from_table(table: list[list[str]], mapping: dict) -> tuple[lis
 
 def extract_document_local(doc: DocumentIngere, templates: dict | None = None) -> tuple[CommandeExtraite | None, dict]:
     """Extraction 100% locale (aucun appel LLM, aucun reseau) d'un document
-    ingere, via detection de tableau + memoire de gabarits appris.
-
-    rapport["mapping_a_valider"] est non-None si l'empreinte d'en-tete du
-    tableau detecte est inconnue -> une validation humaine ponctuelle est
-    necessaire avant que ce document (et tous les suivants au meme format)
-    puisse etre traite automatiquement."""
+    ingere. Selectionne automatiquement, parmi tous les tableaux detectes, le
+    plus vraisemblable pour representer les lignes de commande (voir
+    select_best_table) - une page de garde administrative (MOA, dates, duree,
+    marche) est ecartee automatiquement si elle n'a pas de colonnes numeriques
+    coherentes, sans jamais etre proposee a la validation."""
     templates = templates if templates is not None else load_templates()
     path = Path(doc.chemin)
     ext = path.suffix.lower()
@@ -238,21 +312,32 @@ def extract_document_local(doc: DocumentIngere, templates: dict | None = None) -
         return None, {"erreur": str(exc)}
 
     if not tables:
-        return None, {"erreur": "aucun tableau detecte dans ce document"}
+        return None, {"erreur": "aucun tableau detecte dans ce document \u2014 essayez le flux LLM (onglet 2)"}
 
-    table = max(tables, key=len)
-    header = table[0]
+    table, info = select_best_table(tables)
+    if table is None:
+        return None, {
+            "erreur": "aucune table fiable identifi\u00e9e (probablement une page de garde/r\u00e9capitulatif "
+                      "sans donn\u00e9es de prix exploitables) \u2014 utilisez le flux LLM (onglet 2) pour ce document",
+        }
+
+    header_idx = info["header_idx"]
+    working_table = table[header_idx:]
+    header = working_table[0]
     fp = fingerprint_header(header)
 
     if fp in templates:
         mapping = templates[fp]["mapping"]
         mapping_a_valider = None
     else:
-        mapping = detect_line_columns(header)
-        mapping_a_valider = {"fingerprint": fp, "header": header, "mapping": mapping}
+        mapping = info["mapping"]
+        mapping_a_valider = {
+            "fingerprint": fp, "header": header, "mapping": mapping,
+            "preview_rows": working_table[1:4],
+        }
 
     essentiels_ok = mapping.get("code") is not None and mapping.get("quantite") is not None and mapping.get("pu") is not None
-    lignes, nb_ignorees = extract_lines_from_table(table, mapping) if essentiels_ok else ([], 0)
+    lignes, nb_ignorees = extract_lines_from_table(working_table, mapping) if essentiels_ok else ([], 0)
 
     texte_meta = "\n".join(" ".join(row) for row in table[:3]) + "\n" + doc.texte_brut[:500]
     meta = extract_metadata(texte_meta)
@@ -276,11 +361,6 @@ def extract_document_local(doc: DocumentIngere, templates: dict | None = None) -
 
 
 def extract_batch_local(docs: list[DocumentIngere]) -> tuple[list[CommandeExtraite], list[dict], dict]:
-    """Traite une liste de documents. Retourne (commandes, rapports,
-    gabarits_en_attente) - gabarits_en_attente regroupe par empreinte les
-    documents bloques en attente d'une validation humaine, pour ne demander
-    qu'une seule confirmation meme si plusieurs documents partagent le meme
-    format inconnu."""
     templates = load_templates()
     commandes: list[CommandeExtraite] = []
     rapports: list[dict] = []
