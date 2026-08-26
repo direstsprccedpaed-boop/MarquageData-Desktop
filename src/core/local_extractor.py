@@ -15,7 +15,7 @@ from core.paths import app_data_dir
 TEMPLATES_PATH = app_data_dir() / "data" / "extraction_templates.json"
 
 LINE_KEYWORDS = {
-    "code": ["code prix", "n\u00b0 prix", "n prix", "reference", "r\u00e9f\u00e9rence", "r\u00e9f.", "article", "code"],
+    "code": ["code prix", "n\u00b0 prix", "n prix", "n\u00b0 de prix", "reference", "r\u00e9f\u00e9rence", "r\u00e9f.", "article", "code"],
     "designation": ["designation", "d\u00e9signation", "libelle", "libell\u00e9", "intitul\u00e9", "d\u00e9nomination"],
     "quantite": ["quantite", "quantit\u00e9", "qte", "qt\u00e9", "qty"],
     "unite": ["unite", "unit\u00e9", "un.", "u.", "unit"],
@@ -79,7 +79,7 @@ def detect_line_columns(header: list[str]) -> dict:
 def _parse_number(raw) -> Optional[float]:
     if raw is None:
         return None
-    text = str(raw).strip().replace("\u00a0", "").replace(" ", "")
+    text = str(raw).strip().replace("\u00a0", "").replace(" ", "").replace("\u20ac", "")
     if not text:
         return None
     text = text.replace(",", ".")
@@ -136,15 +136,94 @@ def extract_tables_docx(path: Path) -> list[list[list[str]]]:
     return tables
 
 
-def extract_tables_pdf(path: Path) -> list[list[list[str]]]:
-    tables = []
+def extract_table_by_words_pdf(path: Path, y_tolerance: float = 3.0, x_tolerance: float = 14.0) -> list[list[list[str]]]:
+    """Reconstruction de tableau par position des mots (coordonnees x0/top),
+    independamment de toute detection de grille/bordures.
+
+    Necessaire car de nombreux bons de commande administratifs positionnent
+    le texte en blocs (colonnes visuelles) sans veritables traits de tableau :
+    pdfplumber.extract_tables() lit alors le contenu dans un ordre plus ou
+    moins colonne-par-colonne au lieu de ligne-par-ligne, ce qui desynchronise
+    quantites/prix par rapport aux codes/designations. Confirme sur un cas
+    reel (bon de commande DIR Est, page 2 : la table N\u00b0 de prix/Designation/
+    Unite/Qtes/Prix unitaire sortait de extract_tables() avec les quantites et
+    prix totaux completement decorreles de leur ligne d'origine).
+
+    Principe : regrouper les mots en lignes par proximite verticale, deduire
+    les positions de colonnes ("slots") a partir de la distribution globale
+    des coordonnees x0 de la page, puis reaffecter chaque mot a la colonne la
+    plus proche en concatenant les mots d'une meme cellule."""
+    tables: list[list[list[str]]] = []
     with pdfplumber.open(str(path)) as pdf:
         for page in pdf.pages:
-            for raw_table in page.extract_tables() or []:
-                rows = [["" if c is None else str(c).strip() for c in row] for row in raw_table]
-                rows = [r for r in rows if any(c.strip() for c in r)]
-                if rows:
-                    tables.append(rows)
+            try:
+                words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+            except Exception:
+                continue
+            if not words:
+                continue
+
+            words_sorted = sorted(words, key=lambda w: (w["top"], w["x0"]))
+            rows: list[list[dict]] = []
+            current_row: list[dict] = []
+            current_top: float | None = None
+            for w in words_sorted:
+                if current_top is None or abs(w["top"] - current_top) <= y_tolerance:
+                    current_row.append(w)
+                    current_top = w["top"] if current_top is None else current_top
+                else:
+                    rows.append(current_row)
+                    current_row = [w]
+                    current_top = w["top"]
+            if current_row:
+                rows.append(current_row)
+
+            all_x0 = sorted({round(w["x0"], 1) for w in words})
+            column_slots: list[float] = []
+            for x in all_x0:
+                if not column_slots or x - column_slots[-1] > x_tolerance:
+                    column_slots.append(x)
+
+            grid: list[list[str]] = []
+            for row_words in rows:
+                row_words_sorted = sorted(row_words, key=lambda w: w["x0"])
+                cells = ["" for _ in column_slots]
+                for w in row_words_sorted:
+                    slot_idx = min(range(len(column_slots)), key=lambda i: abs(column_slots[i] - w["x0"]))
+                    cells[slot_idx] = (cells[slot_idx] + " " + w["text"]).strip()
+                if any(c.strip() for c in cells):
+                    grid.append(cells)
+
+            if grid:
+                tables.append(grid)
+    return tables
+
+
+def extract_tables_pdf(path: Path) -> list[list[list[str]]]:
+    """Combine deux strategies d'extraction PDF concurrentes : la detection
+    de grille classique de pdfplumber (fiable quand le PDF a de vraies
+    bordures de cellules), et une reconstruction par position de mots
+    (fiable quand le tableau est fait de blocs de texte positionnes, sans
+    bordures detectables). Les candidats des deux methodes sont ensuite
+    departages par le systeme de score commun (select_best_table) - aucune
+    des deux methodes n'est privilegiee a priori."""
+    tables: list[list[list[str]]] = []
+    try:
+        with pdfplumber.open(str(path)) as pdf:
+            for page in pdf.pages:
+                for raw_table in page.extract_tables() or []:
+                    rows = [["" if c is None else str(c).strip() for c in row] for row in raw_table]
+                    rows = [r for r in rows if any(c.strip() for c in r)]
+                    if rows:
+                        tables.append(rows)
+    except Exception:
+        pass
+
+    try:
+        tables.extend(extract_table_by_words_pdf(path))
+    except Exception:
+        pass
+
     return tables
 
 
@@ -183,11 +262,6 @@ def _keyword_score(row: list[str]) -> tuple[int, dict]:
 
 
 def _numeric_evidence(table: list[list[str]], header_idx: int, max_check_rows: int = 10) -> int:
-    """Compte le nombre de colonnes contenant des valeurs numeriques plausibles
-    sur plusieurs lignes de donnees consecutives - signe fort d'une vraie table
-    de lignes de commande (quantite/prix) par opposition a une table de page
-    de garde (MOA, dates, duree) qui contient surtout du texte ou des cellules
-    vides."""
     data_rows = table[header_idx + 1: header_idx + 1 + max_check_rows]
     if not data_rows:
         return 0
@@ -204,10 +278,6 @@ def _numeric_evidence(table: list[list[str]], header_idx: int, max_check_rows: i
 
 
 def find_header_row(table: list[list[str]], max_scan: int = 4) -> tuple[int, int, dict]:
-    """Cherche, parmi les premieres lignes de la table, celle qui ressemble le
-    plus a un en-tete de tableau de lignes de commande (meilleur score de
-    mots-cles), plutot que de supposer aveuglement que la premiere ligne est
-    l'en-tete (souvent faux en presence de cellules fusionnees/page de garde)."""
     best_idx, best_score, best_mapping = 0, -1, {}
     for idx in range(min(max_scan, len(table))):
         score, mapping = _keyword_score(table[idx])
@@ -236,13 +306,6 @@ def score_candidate_table(table: list[list[str]]) -> dict:
 
 
 def select_best_table(tables: list[list[list[str]]]) -> tuple[Optional[list[list[str]]], Optional[dict]]:
-    """Choisit, parmi tous les tableaux detectes dans le document (une page de
-    garde recapitulative en produit souvent une, la vraie liste de prix une
-    autre), celui qui ressemble le plus a une table de lignes de commande.
-    Si le meilleur candidat n'atteint pas un seuil minimal de confiance
-    (aucun mot-cle reconnu ET moins de 2 colonnes numeriques), on considere
-    qu'aucune table fiable n'a ete trouvee plutot que de proposer une
-    validation sur du bruit."""
     if not tables:
         return None, None
     scored = [(t, score_candidate_table(t)) for t in tables]
@@ -254,10 +317,6 @@ def select_best_table(tables: list[list[list[str]]]) -> tuple[Optional[list[list
 
 
 def extract_lines_from_table(table: list[list[str]], mapping: dict) -> tuple[list[LigneCommande], int]:
-    """table doit commencer par la ligne d'en-tete (index 0 = en-tete).
-    Retourne (lignes_valides, nb_lignes_ignorees). Une ligne est ignoree si
-    le code est vide ou si la quantite/le PU ne sont pas des nombres
-    exploitables - jamais devinee ou inventee."""
     lignes: list[LigneCommande] = []
     nb_ignorees = 0
     for row in table[1:]:
@@ -293,12 +352,6 @@ def extract_lines_from_table(table: list[list[str]], mapping: dict) -> tuple[lis
 
 
 def extract_document_local(doc: DocumentIngere, templates: dict | None = None) -> tuple[CommandeExtraite | None, dict]:
-    """Extraction 100% locale (aucun appel LLM, aucun reseau) d'un document
-    ingere. Selectionne automatiquement, parmi tous les tableaux detectes, le
-    plus vraisemblable pour representer les lignes de commande (voir
-    select_best_table) - une page de garde administrative (MOA, dates, duree,
-    marche) est ecartee automatiquement si elle n'a pas de colonnes numeriques
-    coherentes, sans jamais etre proposee a la validation."""
     templates = templates if templates is not None else load_templates()
     path = Path(doc.chemin)
     ext = path.suffix.lower()
